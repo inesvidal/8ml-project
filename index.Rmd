@@ -1,0 +1,330 @@
+---
+title: "Predicting how well exercise is performed using sensor data"
+author: "Ines Vidal Castiñeira"
+output: html_document
+---
+```{r init, cache=TRUE, echo=FALSE, warning=FALSE, results='hide', message=FALSE}
+# To make code readable
+library(knitr)
+library(xtable)
+library(markdown) 
+library(rmarkdown) 
+library(ggplot2) 
+library(pander)
+library(dplyr)
+library(caret)
+library(randomForest)
+library(rpart)
+library(rattle)
+library(doMC)
+registerDoMC(cores = 2)
+library(YaleToolkit)
+library(corrplot)
+library(stats)
+setwd("~/Coursera/8ml-project")
+set.seed(12345)
+opts_chunk$set(echo = FALSE, cache = TRUE, fig.align = 'center', fig.path='Figs/', warning = FALSE, message=FALSE)
+```
+## Executive Summary
+
+The HAR dataset contains measures of accelerometers worn by by six individuals while performing barbell lifts correctly and in five incorrect ways. Using this data we predict how well (in which manner) the exercise is done.
+The study starts by reducing the dataset dimension, keeping only relevant variables. Then, to be able to assess out of sample error, the training dataset is divided in two, *train* and *test*. Using a sample of the train dataset the relationships between variables are studied and several models tested (random tree, random forest with and without PCA) and the one with the highest accuracy (and reasonable performance) in the *test* dataset is selected.
+Using random forest the type of execution of the exercise is predicted with high accuracy.
+
+```{r, load-data, cache=TRUE, echo=FALSE}
+url_train <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+url_test <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+filename_train <- "pml-training.csv"
+filename_test <- "pml-testing.csv"
+if (!file.exists(filename_train)) {
+    print("INFO: csv file not found")
+    ### Getting the dataset, and unzipping the files
+    download.file(url_train, filename_train, method = "curl", cacheOK = FALSE)
+    date_downloaded <- date()
+    }
+if (!file.exists(filename_test)) {
+    print("INFO: csv file not found")
+    ### Getting the dataset, and unzipping the files
+    download.file(url_test, filename_test, method = "curl")
+    date_downloaded <- date()
+    }
+
+#opening the data
+training <- read.csv(filename_train)
+testing <- read.csv(filename_test)
+```
+
+## Data cleaning
+
+First we review sparsity, and remove rows without any informed value and columns with over 95% uninformed values (they coincide with columns that are only recorded when variable *new_window*="yes"). 
+Finally we exclude columns *row.names*, *X*, *user_name*, *raw_timestamp_part_1*, *raw_timestamp_part_2*, *cvtd_timestamp*, *new_window* and *num_window*, that are considered irrelevant to the experiment.
+
+```{r, clean-data, cache=TRUE, echo=FALSE}
+#whatis(training_cl1)
+clean <- function(x){
+    # Unify blanks and #DIV/0! into NA
+    # print("x0:")
+    # print(dim(x))
+    
+    x[x == "" | x == "#DIV/0!"] <- NA
+    
+    # remove variables/columns with over a certain % of NAs
+    # summary(colSums(is.na(x))/nrow(x)) # only a few collumns have a large number of NAs
+    x <- x[colSums(is.na(x))/nrow(x) <.95]
+    
+    # remove observations/rows with over a certain % of NAs
+    # summary(rowSums(is.na(x))/ncol(x))
+    
+    # check that all is fine
+    # if(!anyNA(x)) 
+    #    print("no NAs in x")
+    return(x)
+    }
+
+training_cl <- clean(training)
+testing_cl <- clean(testing)
+#dim(training_cl) 
+#dim(testing_cl)
+
+# remove variables/columns considered irrelevant for study
+testing_cl <- dplyr::select(testing_cl, -X, -user_name, -raw_timestamp_part_1, -raw_timestamp_part_2, -cvtd_timestamp, -new_window, -num_window)
+training_cl <- dplyr::select(training_cl, -X, -user_name, -raw_timestamp_part_1, -raw_timestamp_part_2, -cvtd_timestamp, -new_window, -num_window)
+```
+That leaves us with a smaller dataset (`r dim(training_cl)[1]` observations and `r dim(training_cl)[2]` variables), in principle equally relevant in modelling terms, and easier to work with in terms of performance.
+
+We decided to keep the test dataset for final validation, and subdivide the clean training set into a training set and a test set, so that we can assess out of sample error. The table below represents the different sets: 
+
+```{r, prepare-data-sets, cache=TRUE, echo=FALSE}
+# Creating working sets
+inTrain <- createDataPartition(y=training_cl$classe, times = 1, p=0.998,list = FALSE)
+train <- training_cl[inTrain,]
+test <- training_cl[-inTrain,]
+validate <- testing_cl 
+
+##############
+# anyNA(train)
+# anyNA(test)
+# anyNA(validate)
+table <- xtable(
+    matrix(c(dim(training), dim(testing), dim(training_cl), dim(train), dim(test), dim(validate)), 
+           ncol = 6, byrow = FALSE,
+           dimnames = list(c("Observations", "Variables"), c("Original training dataset", "Original testing","Clean Training dataset", "Train set", "Test set","Validate set"))),
+    caption = "**Table 1**: Original datasets, and sets considered for the study",
+    auto = TRUE)
+panderOptions('table.split.table', Inf)
+pander(table)
+```
+
+##Data Exploration
+
+```{r, explore-data-var, cache=TRUE, echo=FALSE, fig.width=8, fig.height=8}
+# Study correlations between variables to select those most significant to predict classe
+# dim(train)
+# head(train)
+zero_var <- sum(nearZeroVar(dplyr::select(train, -classe), saveMetrics =TRUE, names = TRUE)$nzv)
+
+# getting a slice of the train dataset to optimise execution time in first trials
+inTrain2 <- createDataPartition(y=train$classe, times = 1, p=0.01,list = FALSE)
+trainx <- train[inTrain2,]
+
+```
+Considering the *train set*, we'll start by checking the number of variables with zero variance (zero_var). 
+
+Initial tests showed that execution times using the complete *train set* are very long, so we decided to proceed with a 1% sample (`r dim(trainx)`) observations), to assess model performance, and go ahead with final prediction only with the models that show good results,
+
+The study of how interrelated variables are is shown in the figure below:
+
+```{r, explore-data-cor, cache=TRUE, echo=FALSE, fig.width=6, fig.height=6}
+cor <- cor(dplyr::select(train,-classe))
+par(oma=c(0,0,1,0), mai=c(0,0,1,0))
+corrplot(cor, method="color", type = "lower", tl.srt=45, tl.cex =.6, tl.col="black")
+title(main = list("\n\n Study of correlations between measures (predictors)"), cex = .8, col = "black")
+```
+
+Considering the number of dark cells (high correlation),  a Principal Components analysis was considered as an option to help identify the main variables to consider in the model, to reduce its complexity (and execution/training time).
+
+```{r, explore_models, cache=TRUE, echo=FALSE, warning=FALSE}
+assess_models <- function(x, y, z, t){
+    
+    t_rpart <- system.time({
+        #print("fit_rpart")
+        fit_rpart <- train(classe ~ ., data = z, method = "rpart")
+        # compare results 
+        acc_rpart <- confusionMatrix(t$classe,predict(fit_rpart, t))$overall[1]
+        })
+    
+    t_gbm <- system.time({
+        #print("fit_gbm")
+        fit_gbm <- train(classe ~ ., data = z, method = "gbm", verbose = FALSE)
+        # compare results 
+        acc_gbm <- confusionMatrix(t$classe,predict(fit_gbm, t))$overall[1]
+        
+        })
+    
+    t_lda <- system.time({
+        #print("fit_lda")
+        fit_lda <- train(classe ~ ., data = z, method = "lda")
+        # compare results 
+        acc_lda <- confusionMatrix(t$classe,predict(fit_lda, t))$overall[1]
+        
+        })
+    
+    t_nb <- system.time({
+        #print("fit_nb")
+        fit_nb <- train(classe ~ ., data = z, method = "nb")
+        # compare results 
+        acc_nb <- confusionMatrix(t$classe,predict(fit_nb, t))$overall[1]
+        
+        })
+    
+    t_rf <- system.time({
+        #print("fit_rf")
+        fit_rf <- randomForest(y ~., data = x)
+        # cv1 <-rfcv(z, y)
+        # with(cv1, plot(n.var, error.cv, log="x", type="o", lwd=2))
+        pred_rf <- predict(fit_rf, t)
+        # obtain accuracy
+        acc_rf <- confusionMatrix(pred_rf, t$classe)$overall[1]
+        
+        })
+    
+    t_pca_rf <- system.time({
+        #print("fit_pca_rf")
+        # create preprocess object
+        preProc <- preProcess(x, method="pca", thresh =.98) # calculate PCs for training data
+        train_pca <- predict(preProc, x)
+        # run model on outcome and principle components
+        fit_pca_rf <- train(y ~ ., data = train_pca, method = "rf") # calculate PCs for test data
+        test_pca_rf <- predict(preProc, t)
+        # compare results 
+        acc_pca_rf <- confusionMatrix(t$classe, predict(fit_pca_rf, test_pca_rf))$overall[1]
+        
+        })
+    
+    t_pca_rf2 <- system.time({
+        #print("fit_pca_rf2")
+        fit_pca_rf2 <- train(y ~ ., data = z, method = "rf", preProcess = "pca", thresh =.98) # calculate PCs for test data    
+        pred_pca_rf2 <- predict(fit_pca_rf2, t)
+        # compare results 
+        acc_pca_rf2 <- confusionMatrix(t$classe, pred_pca_rf2)$overall[1]
+        
+        })
+    
+    t_rf_cv_caret <- system.time({
+        #print("fit_rf_caret con cv")
+        fit_rf_cv_caret <- train(classe ~., data = z, trControl=trainControl(method="cv",number=10, repeats=1))
+        pred_rf_cv_caret <- predict(fit_rf_cv_caret, t)
+        # obtain accuracy
+        acc_rf_cv_caret <- confusionMatrix(pred_rf_cv_caret, t$classe)$overall[1]
+        
+        })
+    
+    t_pca_rf_cv_caret <- system.time({
+        #print("fit_rf_caret cv + pca")
+        fit_pca_rf_cv_caret <- train(classe ~., data = z, preProcess = "pca", trControl=trainControl(method="cv",number=10, repeats=1))
+        pred_pca_rf_cv_caret <- predict(fit_pca_rf_cv_caret, t)
+        # obtain accuracy
+        acc_pca_rf_cv_caret <- confusionMatrix(pred_pca_rf_cv_caret, t$classe)$overall[1]
+        })
+    
+    final_acc <- rbind(acc_rpart, 
+                       acc_gbm, 
+                       acc_lda, 
+                       acc_nb, 
+                       acc_rf, 
+                       acc_pca_rf, 
+                       acc_pca_rf2,
+                       acc_rf_cv_caret,
+                       acc_pca_rf_cv_caret)
+    final_time <- rbind(t_rpart[3], 
+                        t_gbm[3], 
+                        t_lda[3], 
+                        t_nb[3], 
+                        t_rf[3], 
+                        t_pca_rf[3], 
+                        t_pca_rf2[3],
+                        t_rf_cv_caret[3],
+                        t_pca_rf_cv_caret[3])
+    
+    assess <- cbind(final_acc, final_time)
+    # include model details in Accuracy summary table
+    dimnames(assess) <- list(c("Trees (caret-rpart)", 
+                             "Boosting (caret-gbm)", 
+                             "Linear Discriminant analysis (caret-lda)", 
+                             "Naive Bayes (caret-nb)", 
+                             "random forest (randomForest)", 
+                             "PCA + random forest (randomForest)", 
+                             "PCA + random forest (caret-rf)", 
+                             "Random forest w/c.variance (caret-rf)",
+                             "PCA + Random forest w/c.variance (caret-rf)"),
+                             c("Accuracy", "Execution time"))
+    
+    
+    
+    return(assess)
+    }
+
+# x <- dplyr::select(trainx, -classe)
+# y <- trainx$classe
+# z <- trainx
+# t <- test
+
+acc <- assess_models(dplyr::select(trainx, -classe),trainx$classe, trainx, test)
+```
+
+The following table presents the conclusions of model comparison:
+
+```{r, model-selection-viz, cache=TRUE, echo=FALSE}
+
+# visualize summary table
+tab <- xtable(acc,
+              caption = "**Table 2**: Models accuracy comparison using 1% sample of 'train set'",
+              align = c("lcc"))
+panderOptions('table.split.table', 400)
+#pandoc.table(tab, style="rmarkdown")
+pander(tab)
+```
+
+To select final model two criteria have been considered a) the accuracies associated to the models (that we assume will be higher when 100% of the *train set* is considered), and b) the time required to run the model (that will be much higher with the complete *train set*). In this sense, the model with highest accuracy did not run in reasonable time using the *train set*. The model finally selected was the second by accuracy *'random forest (randomForest)'*. The code is shown below:
+
+```{r, validate-0, cache=TRUE, echo=TRUE, fig.width=5, fig.height=5}
+# random forests model
+fit_rf_total <- randomForest(train$classe ~., data = dplyr::select(train, -classe))
+
+# study of out of sample error
+pred_rf_total <- predict(fit_rf_total, test)
+acc_rf_total <- confusionMatrix(pred_rf_total, test$classe)$overall[1]
+```
+
+By having split the training dataset into the train and test datasets we have been able to check that the out of sample error is minimal (accuracy =`r acc_rf_total`), i.e. there is no overfitting.
+
+Cross validation has been assessed using the code below. The figure shows that cross validation is very low, so the model will be valid for prediction using other sets different from the one used for training. The figure below shows that the cross validation remains small regardless of the number of observations considered.
+
+```{r, validate-1, cache=TRUE, echo=TRUE}
+#study of cross validation (very time consuming)
+cv <-rfcv(train, train$classe)
+
+```
+```{r, validate-2, cache=TRUE, echo=FALSE, fig.width=4, fig.height=4}
+# plot cross validation
+with(cv, plot(n.var, error.cv, log="x", type="o", lwd=2))
+title(main = list("Cross validation for selected model", cex = 1, col = "black"))
+```
+
+
+```{r, validate-3, cache=TRUE, echo=FALSE}
+# predict results on validation set to submit assignment
+result <- predict(fit_rf_total, validate)
+```
+
+Finally, using the model we have predicted how well the exercise has been performed (classe) for the testing dataset (*validation set*) with the following results `r result`, that coincide 20/20 with the validation set.
+
+## Conclusions
+The HAR dataset can be modeled using random forests to predict with high accuracy how well the barbell lifts exercise is being performed.
+The number of observations allows to create data subsets to assess out of sample errors. The dataset size make interesting the consideration of strategies to keep execution time under control.
+
+## References
+
+* This document has been generated using *knitr*, the markdown file can be found at: https://github.com/inesvidal/8ml-project/blob/gh-pages/index.Rmd
+* The data for this project come from 'Human Activity Recognition' (HAR):  Ugulino, W.; Cardador, D.; Vega, K.; Velloso, E.; Milidiu, R.; Fuks, H. Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements. Proceedings of 21st Brazilian Symposium on Artificial Intelligence. Advances in Artificial Intelligence - SBIA 2012. In: Lecture Notes in Computer Science. , pp. 52-61. Curitiba, PR: Springer Berlin / Heidelberg, 2012. ISBN 978-3-642-34458-9. DOI: 10.1007/978-3-642-34459-6_6. Read more: http://groupware.les.inf.puc-rio.br/har
